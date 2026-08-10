@@ -100,6 +100,9 @@ describe("BitbucketServer Integration Tests", () => {
         "get_code_insights",
         "get_dashboard_pull_requests",
         "update_pull_request",
+        "get_commit_build_status",
+        "get_commit_build_summary",
+        "get_pull_request_build_status",
       ];
       expect(new Set(toolNames)).toEqual(new Set(expectedTools));
     });

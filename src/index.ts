@@ -264,7 +264,7 @@ export class BitbucketServer {
   }
 
   private setupToolHandlers() {
-    const readOnlyTools = ['list_projects', 'list_repositories', 'get_pull_request', 'list_pull_requests', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository', 'list_branches', 'list_commits', 'get_code_insights', 'get_dashboard_pull_requests'];
+    const readOnlyTools = ['list_projects', 'list_repositories', 'get_pull_request', 'list_pull_requests', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository', 'list_branches', 'list_commits', 'get_code_insights', 'get_dashboard_pull_requests', 'get_commit_build_status', 'get_commit_build_summary', 'get_pull_request_build_status'];
     
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -702,6 +702,43 @@ export class BitbucketServer {
               start: { type: 'number', description: 'Start index for pagination (default: 0).' }
             }
           }
+        },
+        {
+          name: 'get_commit_build_status',
+          description: 'Get the full list of build statuses (CI/CD results) linked to a specific commit. Returns individual build details including state (SUCCESSFUL, FAILED, INPROGRESS), build key, name, URL, and timestamp.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              commitHash: { type: 'string', description: 'Full 40-character SHA of the commit to get build status for.' },
+              limit: { type: 'number', description: 'Maximum number of build results to return (default: 25).' },
+              start: { type: 'number', description: 'Start index for pagination (default: 0).' }
+            },
+            required: ['commitHash']
+          }
+        },
+        {
+          name: 'get_commit_build_summary',
+          description: 'Get aggregated build status counts for a specific commit. Returns the number of successful, failed, and in-progress builds. Use this for a quick pass/fail overview without full build details.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              commitHash: { type: 'string', description: 'Full 40-character SHA of the commit to get build summary for.' }
+            },
+            required: ['commitHash']
+          }
+        },
+        {
+          name: 'get_pull_request_build_status',
+          description: 'Get build status for the head commit of a pull request. Resolves the PR to its latest source commit and returns all linked build statuses. Use this to check if CI has passed before merging.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug containing the pull request.' },
+              prId: { type: 'number', description: 'Pull request ID to get build status for.' }
+            },
+            required: ['repository', 'prId']
+          }
         }
       ].filter(tool => !this.config.readOnly || readOnlyTools.includes(tool.name))
     }));
@@ -1035,6 +1072,26 @@ export class BitbucketServer {
               closedSince: args.closedSince as number | undefined,
               limit: args.limit as number | undefined,
               start: args.start as number | undefined
+            });
+          }
+
+          case 'get_commit_build_status': {
+            return await this.getCommitBuildStatus(
+              args.commitHash as string,
+              args.limit as number | undefined,
+              args.start as number | undefined
+            );
+          }
+
+          case 'get_commit_build_summary': {
+            return await this.getCommitBuildSummary(args.commitHash as string);
+          }
+
+          case 'get_pull_request_build_status': {
+            return await this.getPullRequestBuildStatus({
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              prId: args.prId as number
             });
           }
 
@@ -2257,6 +2314,87 @@ export class BitbucketServer {
 
     return {
       content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+    };
+  }
+
+  private async getCommitBuildStatus(commitHash: string, limit?: number, start?: number) {
+    if (!commitHash) {
+      throw new McpError(ErrorCode.InvalidParams, 'commitHash is required');
+    }
+
+    const params: Record<string, unknown> = {};
+    if (limit !== undefined) params.limit = limit;
+    if (start !== undefined) params.start = start;
+
+    const response = await this.api.get(
+      `/commits/${commitHash}`,
+      {
+        baseURL: `${this.config.baseUrl}/rest/build-status/1.0`,
+        params
+      }
+    );
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+    };
+  }
+
+  private async getCommitBuildSummary(commitHash: string) {
+    if (!commitHash) {
+      throw new McpError(ErrorCode.InvalidParams, 'commitHash is required');
+    }
+
+    const response = await this.api.get(
+      `/commits/stats/${commitHash}`,
+      { baseURL: `${this.config.baseUrl}/rest/build-status/1.0` }
+    );
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+    };
+  }
+
+  private async getPullRequestBuildStatus(params: PullRequestParams) {
+    const { project, repository, prId } = params;
+
+    if (!project || !repository || !prId) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Project, repository, and prId are required'
+      );
+    }
+
+    // Get the PR to find the head commit
+    const prResponse = await this.api.get(
+      `/projects/${project}/repos/${repository}/pull-requests/${prId}`
+    );
+    const headCommit = prResponse.data.fromRef?.latestCommit;
+
+    if (!headCommit) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        'Could not determine head commit for pull request'
+      );
+    }
+
+    // Get build status for that commit
+    const buildResponse = await this.api.get(
+      `/commits/${headCommit}`,
+      { baseURL: `${this.config.baseUrl}/rest/build-status/1.0` }
+    );
+
+    // Get summary counts too
+    const summaryResponse = await this.api.get(
+      `/commits/stats/${headCommit}`,
+      { baseURL: `${this.config.baseUrl}/rest/build-status/1.0` }
+    );
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        commit: headCommit,
+        summary: summaryResponse.data,
+        builds: buildResponse.data.values ?? []
+      }, null, 2) }]
     };
   }
 

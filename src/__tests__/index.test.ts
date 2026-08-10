@@ -578,4 +578,163 @@ describe("BitbucketServer", () => {
       expect(parsed.values).toHaveLength(1);
     });
   });
+
+  describe("Build Status Operations", () => {
+    beforeEach(() => {
+      makeServer(BASE_ENV);
+    });
+
+    describe("get_commit_build_status", () => {
+      test("should fetch build statuses for a commit", async () => {
+        const buildData = {
+          size: 2,
+          values: [
+            { state: "SUCCESSFUL", key: "build-1", name: "CI Pipeline", url: "https://ci.example.com/1" },
+            { state: "FAILED", key: "build-2", name: "Security Scan", url: "https://ci.example.com/2" },
+          ],
+        };
+        mockApiGet.mockResolvedValueOnce(createAxiosResponse(buildData));
+
+        const result = await callTool("get_commit_build_status", {
+          commitHash: "abc123def456abc123def456abc123def456abc1",
+        });
+
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/commits/abc123def456abc123def456abc123def456abc1",
+          expect.objectContaining({
+            baseURL: "https://bb.example.com/rest/build-status/1.0",
+            params: {},
+          }),
+        );
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.values).toHaveLength(2);
+        expect(parsed.values[0].state).toBe("SUCCESSFUL");
+      });
+
+      test("should forward pagination params", async () => {
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({ size: 1, values: [{ state: "INPROGRESS", key: "build-3" }] }),
+        );
+
+        await callTool("get_commit_build_status", {
+          commitHash: "abc123def456abc123def456abc123def456abc1",
+          limit: 10,
+          start: 5,
+        });
+
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/commits/abc123def456abc123def456abc123def456abc1",
+          expect.objectContaining({
+            params: { limit: 10, start: 5 },
+          }),
+        );
+      });
+    });
+
+    describe("get_commit_build_summary", () => {
+      test("should fetch aggregated build counts for a commit", async () => {
+        const summaryData = { successful: 3, failed: 1, inProgress: 0 };
+        mockApiGet.mockResolvedValueOnce(createAxiosResponse(summaryData));
+
+        const result = await callTool("get_commit_build_summary", {
+          commitHash: "abc123def456abc123def456abc123def456abc1",
+        });
+
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/commits/stats/abc123def456abc123def456abc123def456abc1",
+          expect.objectContaining({
+            baseURL: "https://bb.example.com/rest/build-status/1.0",
+          }),
+        );
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.successful).toBe(3);
+        expect(parsed.failed).toBe(1);
+        expect(parsed.inProgress).toBe(0);
+      });
+    });
+
+    describe("get_pull_request_build_status", () => {
+      test("should resolve PR head commit and return combined build info", async () => {
+        // First call: get PR details
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({
+            fromRef: { latestCommit: "head123abc456def789head123abc456def789ab" },
+          }),
+        );
+        // Second call: build status for that commit
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({
+            values: [{ state: "SUCCESSFUL", key: "pipeline", name: "CI" }],
+          }),
+        );
+        // Third call: build summary
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({ successful: 1, failed: 0, inProgress: 0 }),
+        );
+
+        const result = await callTool("get_pull_request_build_status", {
+          project: "TEST",
+          repository: "my-repo",
+          prId: 42,
+        });
+
+        // Verify PR was fetched
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/projects/TEST/repos/my-repo/pull-requests/42",
+        );
+        // Verify build status fetched with head commit
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/commits/head123abc456def789head123abc456def789ab",
+          expect.objectContaining({
+            baseURL: "https://bb.example.com/rest/build-status/1.0",
+          }),
+        );
+        // Verify combined response
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.commit).toBe("head123abc456def789head123abc456def789ab");
+        expect(parsed.summary.successful).toBe(1);
+        expect(parsed.builds).toHaveLength(1);
+        expect(parsed.builds[0].state).toBe("SUCCESSFUL");
+      });
+
+      test("should throw when head commit cannot be determined", async () => {
+        // PR response with no latestCommit
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({ fromRef: {} }),
+        );
+
+        await expect(
+          callTool("get_pull_request_build_status", {
+            project: "TEST",
+            repository: "my-repo",
+            prId: 99,
+          }),
+        ).rejects.toThrow("Could not determine head commit for pull request");
+      });
+
+      test("should use default project when project is omitted", async () => {
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({
+            fromRef: { latestCommit: "def456abc789def456abc789def456abc789def4" },
+          }),
+        );
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({ values: [] }),
+        );
+        mockApiGet.mockResolvedValueOnce(
+          createAxiosResponse({ successful: 0, failed: 0, inProgress: 0 }),
+        );
+
+        await callTool("get_pull_request_build_status", {
+          repository: "my-repo",
+          prId: 7,
+        });
+
+        // Should use DEFAULT from BASE_ENV
+        expect(mockApiGet).toHaveBeenCalledWith(
+          "/projects/DEFAULT/repos/my-repo/pull-requests/7",
+        );
+      });
+    });
+  });
 });
