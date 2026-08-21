@@ -193,6 +193,7 @@ export class BitbucketServer {
   private readonly server: Server;
   private readonly api: AxiosInstance;
   private readonly config: BitbucketConfig;
+  private cachedUserSlug: string | null = null;
 
   constructor(options?: BitbucketServerOptions) {
     this.server = new Server(
@@ -628,6 +629,19 @@ export class BitbucketServer {
           }
         },
         {
+          name: 'needs_work_pull_request',
+          description: 'Mark a pull request as "needs work" as the current user. Use this to indicate that changes are required before the PR can be merged. This sets your reviewer status to NEEDS_WORK.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug containing the pull request.' },
+              prId: { type: 'number', description: 'Pull request ID to mark as needs work.' }
+            },
+            required: ['repository', 'prId']
+          }
+        },
+        {
           name: 'edit_comment',
           description: 'Edit an existing comment on a pull request. Use this to fix typos, update information, or reformat comments. Requires the comment version for optimistic locking.',
           inputSchema: {
@@ -1014,6 +1028,15 @@ export class BitbucketServer {
               prId: args.prId as number
             };
             return await this.unapprovePullRequest(unapprovePrParams);
+          }
+
+          case 'needs_work_pull_request': {
+            const needsWorkPrParams: PullRequestParams = {
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              prId: args.prId as number
+            };
+            return await this.needsWorkPullRequest(needsWorkPrParams);
           }
 
           case 'edit_comment': {
@@ -2309,6 +2332,56 @@ export class BitbucketServer {
 
     const response = await this.api.delete(
       `/projects/${project}/repos/${repository}/pull-requests/${prId}/approve`,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+    };
+  }
+
+  private async getCurrentUserSlug(): Promise<string> {
+    if (this.cachedUserSlug) {
+      return this.cachedUserSlug;
+    }
+
+    // Resolve the authenticated user from the X-AUSERNAME response header,
+    // which Bitbucket Server sets on any authenticated REST call. This is
+    // reliable under both PAT (Bearer) and basic auth. The previously used
+    // /plugins/servlet/applinks/whoami servlet returns HTTP 200 with an empty
+    // body on some Bitbucket Server versions (observed on 9.4.3), which made
+    // user resolution fail even with valid credentials.
+    // Reuse this.api so the configured base URL and auth headers are applied.
+    const response = await this.api.get('/application-properties');
+
+    const slug = (response.headers['x-ausername'] as string | undefined)?.trim();
+    if (!slug || slug === 'anonymous') {
+      throw new McpError(
+        ErrorCode.InternalError,
+        'Unable to determine the authenticated user. Ensure your credentials are valid.'
+      );
+    }
+
+    this.cachedUserSlug = slug;
+    return slug;
+  }
+
+  private async needsWorkPullRequest(params: PullRequestParams) {
+    const { project, repository, prId } = params;
+
+    if (!project || !repository || !prId) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Project, repository, and prId are required'
+      );
+    }
+
+    // Resolve the authenticated user's slug
+    const userSlug = await this.getCurrentUserSlug();
+
+    const response = await this.api.put(
+      `/projects/${project}/repos/${repository}/pull-requests/${prId}/participants/${userSlug}`,
+      { status: 'NEEDS_WORK' },
       { headers: { 'Content-Type': 'application/json' } }
     );
 

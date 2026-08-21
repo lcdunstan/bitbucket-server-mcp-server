@@ -94,6 +94,7 @@ describe("BitbucketServer Integration Tests", () => {
         "delete_branch",
         "approve_pull_request",
         "unapprove_pull_request",
+        "needs_work_pull_request",
         "edit_comment",
         "delete_comment",
         "publish_review",
