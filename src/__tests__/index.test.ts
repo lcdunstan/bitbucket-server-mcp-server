@@ -25,6 +25,9 @@ const mockApiGet: Mock<(url: string) => Promise<AxiosResponse>> = vi.fn();
 const mockApiPost: Mock<
   (url: string, data?: unknown) => Promise<AxiosResponse>
 > = vi.fn();
+const mockApiPut: Mock<
+  (url: string, data?: unknown) => Promise<AxiosResponse>
+> = vi.fn();
 const mockIsAxiosError: Mock<(payload: unknown) => boolean> = vi.fn();
 const mockSetRequestHandler: Mock<
   (
@@ -113,6 +116,7 @@ describe("BitbucketServer", () => {
     mockCreate.mockReturnValue({
       get: mockApiGet,
       post: mockApiPost,
+      put: mockApiPut,
     } as unknown as AxiosInstance);
   });
 
@@ -254,6 +258,7 @@ describe("BitbucketServer", () => {
       mockCreate.mockReturnValue({
         get: mockApiGet,
         post: mockApiPost,
+        put: mockApiPut,
       } as unknown as AxiosInstance);
       makeServer({
         BITBUCKET_URL: "https://bb.example.com",
@@ -735,6 +740,123 @@ describe("BitbucketServer", () => {
           "/projects/DEFAULT/repos/my-repo/pull-requests/7",
         );
       });
+    });
+  });
+
+  describe("create_or_update_file", () => {
+    beforeEach(() => {
+      makeServer(BASE_ENV);
+    });
+
+    function getFormValue(form: unknown, key: string): string | null {
+      // Node's global FormData is used by the implementation.
+      return (form as FormData).get(key) as string | null;
+    }
+
+    test("commits file content to the browse endpoint with explicit project", async () => {
+      mockApiPut.mockResolvedValueOnce(
+        createAxiosResponse({ id: "newcommit123" }),
+      );
+
+      const result = await callTool("create_or_update_file", {
+        project: "TEST",
+        repository: "repo",
+        filePath: "src/config.yml",
+        content: "key: value\n",
+        message: "Update config",
+        branch: "main",
+        sourceCommitId: "oldcommit456",
+      });
+
+      expect(mockApiPut).toHaveBeenCalledTimes(1);
+      const [url, form] = mockApiPut.mock.calls[0];
+      expect(url).toBe("/projects/TEST/repos/repo/browse/src/config.yml");
+      expect(getFormValue(form, "content")).toBe("key: value\n");
+      expect(getFormValue(form, "message")).toBe("Update config");
+      expect(getFormValue(form, "branch")).toBe("main");
+      expect(getFormValue(form, "sourceCommitId")).toBe("oldcommit456");
+      expect(JSON.parse(result.content[0].text)).toEqual({ id: "newcommit123" });
+    });
+
+    test("uses default project and encodes path segments", async () => {
+      mockApiPut.mockResolvedValueOnce(createAxiosResponse({ id: "c1" }));
+
+      await callTool("create_or_update_file", {
+        repository: "repo",
+        filePath: "docs/my file.md",
+        content: "# Title",
+        message: "Add doc",
+        branch: "main",
+      });
+
+      const [url, form] = mockApiPut.mock.calls[0];
+      // Space encoded, slash preserved as separator.
+      expect(url).toBe("/projects/DEFAULT/repos/repo/browse/docs/my%20file.md");
+      // Optional fields omitted when not provided.
+      expect(getFormValue(form, "sourceCommitId")).toBeNull();
+      expect(getFormValue(form, "sourceBranch")).toBeNull();
+    });
+
+    test("includes sourceBranch when creating a new branch", async () => {
+      mockApiPut.mockResolvedValueOnce(createAxiosResponse({ id: "c2" }));
+
+      await callTool("create_or_update_file", {
+        repository: "repo",
+        filePath: "README.md",
+        content: "hello",
+        message: "edit on new branch",
+        branch: "feature/edit",
+        sourceBranch: "main",
+      });
+
+      const [, form] = mockApiPut.mock.calls[0];
+      expect(getFormValue(form, "sourceBranch")).toBe("main");
+    });
+
+    test("surfaces conflict errors from the API", async () => {
+      mockIsAxiosError.mockReturnValue(true);
+      mockApiPut.mockRejectedValueOnce({
+        response: {
+          status: 409,
+          data: { message: "The file has changed since commit oldcommit456" },
+        },
+        message: "Request failed with status code 409",
+      });
+
+      await expect(
+        callTool("create_or_update_file", {
+          project: "TEST",
+          repository: "repo",
+          filePath: "src/config.yml",
+          content: "key: value",
+          message: "Update config",
+          branch: "main",
+          sourceCommitId: "oldcommit456",
+        }),
+      ).rejects.toThrow(
+        "Bitbucket API error: The file has changed since commit oldcommit456",
+      );
+    });
+
+    test("is rejected in read-only mode", async () => {
+      vi.clearAllMocks();
+      mockCreate.mockReturnValue({
+        get: mockApiGet,
+        post: mockApiPost,
+        put: mockApiPut,
+      } as unknown as AxiosInstance);
+      makeServer({ ...BASE_ENV, BITBUCKET_READ_ONLY: "true" });
+
+      await expect(
+        callTool("create_or_update_file", {
+          repository: "repo",
+          filePath: "README.md",
+          content: "x",
+          message: "m",
+          branch: "main",
+        }),
+      ).rejects.toThrow("not available in read-only mode");
+      expect(mockApiPut).not.toHaveBeenCalled();
     });
   });
 });

@@ -157,6 +157,17 @@ interface FileContentOptions extends ListOptions {
   branch?: string;
 }
 
+interface CreateOrUpdateFileOptions {
+  project?: string;
+  repository?: string;
+  filePath: string;
+  content: string;
+  message: string;
+  branch: string;
+  sourceCommitId?: string;
+  sourceBranch?: string;
+}
+
 interface BranchListOptions extends ListOptions {
   project?: string;
   repository?: string;
@@ -516,6 +527,24 @@ export class BitbucketServer {
               start: { type: 'number', description: 'Starting line number for pagination (0-based, default: 0).' }
             },
             required: ['repository', 'filePath']
+          }
+        },
+        {
+          name: 'create_or_update_file',
+          description: 'Create a new file or update an existing file in a repository by committing directly to a branch. This is the same operation as the Bitbucket web UI "Edit" button. Sends the complete file content (not a diff) and produces a single commit. Use sourceCommitId to guard against overwriting concurrent changes (the request fails with a conflict if the file has moved on since that commit). Handles a single file per commit.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug containing the file.' },
+              filePath: { type: 'string', description: 'Path to the file in the repository (e.g., "src/config.yml", "README.md"). Created if it does not exist.' },
+              content: { type: 'string', description: 'The complete new content of the file. This replaces the entire file; it is not a diff or patch.' },
+              message: { type: 'string', description: 'Commit message describing the change.' },
+              branch: { type: 'string', description: 'Branch to commit to (e.g., "main"). If it does not exist and sourceBranch is provided, it is created from sourceBranch.' },
+              sourceCommitId: { type: 'string', description: 'Optional commit ID the edit is based on. Used for optimistic locking: if the file has changed since this commit, the request fails with a conflict. Omit to skip the check (risks overwriting concurrent edits).' },
+              sourceBranch: { type: 'string', description: 'Optional. When creating a new branch, the branch to create it from.' }
+            },
+            required: ['repository', 'filePath', 'content', 'message', 'branch']
           }
         },
         {
@@ -1118,6 +1147,19 @@ export class BitbucketServer {
             });
           }
 
+          case 'create_or_update_file': {
+            return await this.createOrUpdateFile({
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              filePath: args.filePath as string,
+              content: args.content as string,
+              message: args.message as string,
+              branch: args.branch as string,
+              sourceCommitId: args.sourceCommitId as string | undefined,
+              sourceBranch: args.sourceBranch as string | undefined
+            });
+          }
+
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -1278,6 +1320,40 @@ export class BitbucketServer {
         },
         reviewers: reviewers.length > 0 ? reviewers : undefined
       }
+    );
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+    };
+  }
+
+  private async createOrUpdateFile(options: CreateOrUpdateFileOptions) {
+    const { project, repository, filePath, content, message, branch, sourceCommitId, sourceBranch } = options;
+
+    if (!project || !repository || !filePath || content === undefined || !message || !branch) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Project, repository, filePath, content, message, and branch are required'
+      );
+    }
+
+    // The "Edit file" endpoint expects multipart/form-data, unlike the JSON
+    // payloads used elsewhere in this server. Node 18+ provides a global
+    // FormData; passing it to Axios lets the HTTP layer set the multipart
+    // Content-Type and boundary automatically.
+    const form = new FormData();
+    form.append('content', content);
+    form.append('message', message);
+    form.append('branch', branch);
+    if (sourceCommitId) form.append('sourceCommitId', sourceCommitId);
+    if (sourceBranch) form.append('sourceBranch', sourceBranch);
+
+    // Encode each path segment but keep the slashes as separators.
+    const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
+
+    const response = await this.api.put(
+      `/projects/${project}/repos/${repository}/browse/${encodedPath}`,
+      form
     );
 
     return {

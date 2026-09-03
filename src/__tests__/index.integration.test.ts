@@ -87,6 +87,7 @@ describe("BitbucketServer Integration Tests", () => {
         "get_comments",
         "search",
         "get_file_content",
+        "create_or_update_file",
         "browse_repository",
         "list_pull_requests",
         "list_branches",
